@@ -215,6 +215,10 @@ fn browser_code_to_config_value(code: &str) -> Option<String> {
         "ArrowLeft" => "left",
         "ArrowRight" => "right",
         "CapsLock" => "capslock",
+        "PrintScreen" => "printscreen",
+        "ScrollLock" => "scrolllock",
+        "Pause" => "pause",
+        "NumLock" => "numlock",
         "Backquote" => "`",
         "Minus" => "-",
         "Equal" => "=",
@@ -536,6 +540,34 @@ mod tests {
             InputBinding::Mouse(Button::Unknown(2))
         );
         assert!(normalize_browser_mouse_button(-1).is_none());
+    }
+
+    #[test]
+    fn browser_normalization_supports_pause_scrolllock_printscreen_numlock() {
+        assert_eq!(
+            normalize_browser_key_code("Pause").unwrap(),
+            InputBinding::Key(Key::Pause)
+        );
+        assert_eq!(
+            normalize_browser_key_code("ScrollLock").unwrap(),
+            InputBinding::Key(Key::ScrollLock)
+        );
+        assert_eq!(
+            normalize_browser_key_code("PrintScreen").unwrap(),
+            InputBinding::Key(Key::PrintScreen)
+        );
+        assert_eq!(
+            normalize_browser_key_code("NumLock").unwrap(),
+            InputBinding::Key(Key::NumLock)
+        );
+    }
+
+    #[test]
+    fn parse_hotkey_roundtrips_media_keys_to_config_values() {
+        for hotkey in ["pause", "scrolllock", "printscreen", "numlock"] {
+            let binding = parse_hotkey(hotkey).unwrap();
+            assert_eq!(binding.config_value(), hotkey);
+        }
     }
 
     #[test]

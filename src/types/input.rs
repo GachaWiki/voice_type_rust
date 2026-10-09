@@ -411,25 +411,31 @@ impl HotkeyState {
         false
     }
 
-    /// Check whether `key` matches the target binding, treating left/right
-    /// modifier pairs as interchangeable.
+    /// Check whether `key` matches the target binding.
     ///
-    /// A binding of ShiftLeft also matches ShiftRight (and vice versa); the same
-    /// applies to ControlLeft/ControlRight, Alt/AltGr, and MetaLeft/MetaRight.
-    /// Non-modifier bindings still require exact equality.
-    fn matches_modifier(&self, key: Key) -> bool {
+    /// Side semantics:
+    /// - Explicit right-side bindings (`shiftright`, `ctrlright`, `altright`,
+    ///   `metaright`) match only that physical key.
+    /// - Generic modifier names (`shift`, `ctrl`, `meta`) parse to the left
+    ///   variant and match either physical side, since the config vocabulary
+    ///   has no separate "strict left" form.
+    /// - `alt` matches only the left Alt. On international layouts (Turkish Q
+    ///   and other AltGr layouts) Windows reports AltGr as Left Ctrl +
+    ///   Right Alt and it composes characters, so it must only ever trigger
+    ///   via the explicit `altright` binding.
+    /// - Non-modifier bindings require exact equality.
+    fn matches_target_key(&self, key: Key) -> bool {
         match self.get_target_binding() {
             InputBinding::Key(target) => {
                 if target == key {
                     return true;
                 }
-                let same_side = |a: Key, b: Key, left: Key, right: Key| {
-                    (a == left || a == right) && (b == left || b == right)
+                let generic_matches_either = |left: Key, right: Key| {
+                    target == left && (key == left || key == right)
                 };
-                same_side(target, key, Key::ShiftLeft, Key::ShiftRight)
-                    || same_side(target, key, Key::ControlLeft, Key::ControlRight)
-                    || same_side(target, key, Key::Alt, Key::AltGr)
-                    || same_side(target, key, Key::MetaLeft, Key::MetaRight)
+                generic_matches_either(Key::ShiftLeft, Key::ShiftRight)
+                    || generic_matches_either(Key::ControlLeft, Key::ControlRight)
+                    || generic_matches_either(Key::MetaLeft, Key::MetaRight)
             }
             // Mouse bindings never match a keyboard key.
             InputBinding::Mouse(_) => false,
@@ -446,19 +452,31 @@ impl HotkeyState {
             keys.insert(key);
         }
 
-        if self.matches_modifier(key) {
+        if self.matches_target_key(key) {
             self.is_recording.store(true, Ordering::Release);
         }
     }
 
     /// Record a key release.
+    ///
+    /// Recording stops only when no key that still matches the binding is
+    /// held, so releasing one side of a generic modifier pair while the other
+    /// side stays held (e.g. generic `ctrl` with both ctrls pressed) does not
+    /// cut the recording short.
     pub fn release_key(&self, key: Key) {
         if let Ok(mut keys) = self.pressed_keys.lock() {
             keys.remove(&key);
         }
 
-        if self.matches_modifier(key) {
-            self.is_recording.store(false, Ordering::Release);
+        if self.matches_target_key(key) {
+            let still_held = self
+                .pressed_keys
+                .lock()
+                .map(|keys| keys.iter().any(|held| self.matches_target_key(*held)))
+                .unwrap_or(false);
+            if !still_held {
+                self.is_recording.store(false, Ordering::Release);
+            }
         }
     }
 
@@ -483,5 +501,100 @@ impl HotkeyState {
     /// Check if push-to-talk is currently active.
     pub fn is_recording(&self) -> bool {
         self.is_recording.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recording_with(hotkey: &str) -> HotkeyState {
+        let binding = crate::input::parse_hotkey(hotkey).unwrap();
+        HotkeyState::new(binding)
+    }
+
+    #[test]
+    fn explicit_right_ctrl_ignores_left_ctrl() {
+        let state = recording_with("ctrlright");
+
+        state.press_key(Key::ControlLeft);
+        assert!(!state.is_recording(), "Left Ctrl must not trigger Right Ctrl");
+
+        state.press_key(Key::ControlRight);
+        assert!(state.is_recording());
+
+        state.release_key(Key::ControlRight);
+        assert!(!state.is_recording());
+    }
+
+    #[test]
+    fn explicit_altgr_ignores_left_alt() {
+        let state = recording_with("altright");
+
+        state.press_key(Key::Alt);
+        assert!(!state.is_recording(), "Left Alt must not trigger AltGr");
+
+        // Windows reports AltGr as Left Ctrl + Right Alt; the companion
+        // ControlLeft event must not interfere either way.
+        state.press_key(Key::ControlLeft);
+        assert!(!state.is_recording());
+
+        state.press_key(Key::AltGr);
+        assert!(state.is_recording());
+
+        state.release_key(Key::AltGr);
+        assert!(!state.is_recording());
+    }
+
+    #[test]
+    fn generic_alt_ignores_altgr() {
+        let state = recording_with("alt");
+
+        state.press_key(Key::AltGr);
+        assert!(
+            !state.is_recording(),
+            "AltGr composes characters on AltGr layouts and must not trigger generic alt"
+        );
+
+        state.press_key(Key::Alt);
+        assert!(state.is_recording());
+    }
+
+    #[test]
+    fn generic_ctrl_matches_both_sides() {
+        let state = recording_with("ctrl");
+
+        state.press_key(Key::ControlRight);
+        assert!(state.is_recording(), "generic ctrl matches either side");
+
+        // Holding both sides then releasing one must keep the recording up.
+        state.press_key(Key::ControlLeft);
+        state.release_key(Key::ControlRight);
+        assert!(state.is_recording(), "other side still held");
+
+        state.release_key(Key::ControlLeft);
+        assert!(!state.is_recording());
+    }
+
+    #[test]
+    fn explicit_right_shift_ignores_left_shift() {
+        let state = recording_with("shiftright");
+
+        state.press_key(Key::ShiftLeft);
+        assert!(!state.is_recording());
+
+        state.press_key(Key::ShiftRight);
+        assert!(state.is_recording());
+    }
+
+    #[test]
+    fn switching_binding_unsticks_recording() {
+        let state = recording_with("ctrlright");
+        state.press_key(Key::ControlRight);
+        assert!(state.is_recording());
+
+        let replacement = crate::input::parse_hotkey("pause").unwrap();
+        state.set_target_binding(replacement);
+        assert!(!state.is_recording());
     }
 }
